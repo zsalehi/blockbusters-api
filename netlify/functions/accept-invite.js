@@ -31,13 +31,16 @@ exports.handler = async (event) => {
 
   const { data: invite, error: invErr } = await supabaseAdmin
     .from("team_invitations")
-    .select("id, team_id, invitee_email, status, expires_at")
+    .select("id, team_id, competition_id, invitee_email, status, expires_at")
     .eq("token", token)
     .single();
 
   if (invErr || !invite) return json(404, { error: "Invite not found" });
   if (invite.status !== "pending") return json(400, { error: "Invite is not pending" });
-  if (new Date(invite.expires_at) < new Date()) return json(400, { error: "Invite expired" });
+  if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
+  return json(400, { error: "Invite expired" })
+  }
+
 
   // Strict email match (recommended for MVP security)
   const authedEmail = (user.email || "").trim().toLowerCase();
@@ -45,8 +48,12 @@ exports.handler = async (event) => {
   if (authedEmail !== invitedEmail) return json(403, { error: "Invite sent to a different email" });
 
   const { error: memberErr } = await supabaseAdmin
-    .from("team_members")
-    .insert({ team_id: invite.team_id, user_id: user.id, role: "member" });
+  .from("team_members")
+  .upsert(
+    { team_id: invite.team_id, user_id: user.id, role: "member" },
+    { onConflict: "team_id,user_id" }
+  )
+
 
   if (memberErr) return json(400, { error: memberErr.message });
 
