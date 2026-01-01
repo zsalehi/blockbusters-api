@@ -54,6 +54,12 @@ exports.handler = async (event) => {
         .filter((e) => e !== captainEmail.toLowerCase())
     )]
 
+    // Team size rules (including captain)
+    const totalSize = 1 + normalized.length
+
+    if (totalSize < 2) return json(400, { error: "Add at least 1 teammate email (min team size is 2 including you)." })
+    if (totalSize > 4) return json(400, { error: "Too many teammates. Max team size is 4 including you (max 3 emails)." })
+
     // (Optional) sanity limit
     if (normalized.length > 10) return json(400, { error: "Too many invites" })
 

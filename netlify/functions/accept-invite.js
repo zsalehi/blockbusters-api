@@ -47,6 +47,17 @@ exports.handler = async (event) => {
   const invitedEmail = (invite.invitee_email || "").trim().toLowerCase();
   if (authedEmail !== invitedEmail) return json(403, { error: "Invite sent to a different email" });
 
+  const { count, error: countErr } = await supabaseAdmin
+  .from("team_members")
+  .select("*", { count: "exact", head: true })
+  .eq("team_id", invite.team_id)
+
+  if (countErr) return json(400, { error: countErr.message })
+
+  // count includes captain and anyone already accepted
+  if ((count || 0) >= 4) return json(400, { error: "Team is already full (max 4 members)." })
+
+
   const { error: memberErr } = await supabaseAdmin
   .from("team_members")
   .upsert(
