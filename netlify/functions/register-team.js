@@ -79,7 +79,7 @@ exports.handler = async (event) => {
 
     // 3) Create invitations + send emails
     const inviteRows = normalized.map((email) => ({
-      team_id: team.id,
+      team_id: team.id, competition_id,
       invitee_email: email,
       status: "pending",
       token: crypto.randomBytes(24).toString("hex"),
