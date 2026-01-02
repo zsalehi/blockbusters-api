@@ -54,6 +54,23 @@ exports.handler = async (event) => {
         .filter((e) => e !== captainEmail.toLowerCase())
     )]
 
+    // STRICT RULE: user can only be on one team per competition (captain OR member)
+    const { data: existingMemberRows, error: exErr } = await supabaseAdmin
+        .from("team_members")
+        .select("team_id, teams!inner(competition_id)")
+        .eq("user_id", captain.id)
+        .eq("teams.competition_id", competition_id)
+
+    if (exErr) return json(400, { error: exErr.message })
+
+    if (existingMemberRows && existingMemberRows.length > 0) {
+    return json(409, {
+        error: "You’re already registered on a team for this competition.",
+        team_id: existingMemberRows[0].team_id,
+    })
+    }
+
+
     // Team size rules (including captain)
     const totalSize = 1 + normalized.length
 
@@ -62,6 +79,8 @@ exports.handler = async (event) => {
 
     // (Optional) sanity limit
     if (normalized.length > 10) return json(400, { error: "Too many invites" })
+
+
 
     // 1) Create team tied to competition
     const { data: team, error: teamErr } = await supabaseAdmin
@@ -85,12 +104,15 @@ exports.handler = async (event) => {
 
     // 3) Create invitations + send emails
     const inviteRows = normalized.map((email) => ({
-      team_id: team.id, competition_id,
-      invitee_email: email, invited_by: captainEmail || "captain",
-      inviter_user_id: captain.id,
-      status: "pending",
-      token: crypto.randomBytes(24).toString("hex"),
+        team_id: team.id,
+        competition_id,
+        invitee_email: email,
+        invited_by: captainEmail || "captain",
+        inviter_user_id: captain.id,
+        status: "pending",
+        token: crypto.randomBytes(24).toString("hex"),
     }))
+
 
     const { data: invites, error: invErr } = await supabaseAdmin
       .from("team_invitations")
