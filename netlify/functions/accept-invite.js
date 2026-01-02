@@ -57,6 +57,15 @@ exports.handler = async (event) => {
   // count includes captain and anyone already accepted
   if ((count || 0) >= 4) return json(400, { error: "Team is already full (max 4 members)." })
 
+  // Block accepting if user is already on a team for this competition
+  const { data: existing, error: exErr2 } = await supabaseAdmin
+    .from("team_members")
+    .select("team_id, teams!inner(competition_id)")
+    .eq("user_id", user.id)
+    .eq("teams.competition_id", invite.competition_id)
+
+  if (exErr2) return json(400, { error: exErr2.message })
+  if (existing && existing.length) return json(409, { error: "You’re already on a team for this competition." })
 
   const { error: memberErr } = await supabaseAdmin
   .from("team_members")
