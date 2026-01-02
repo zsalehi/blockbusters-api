@@ -86,7 +86,8 @@ exports.handler = async (event) => {
     // 3) Create invitations + send emails
     const inviteRows = normalized.map((email) => ({
       team_id: team.id, competition_id,
-      invitee_email: email,
+      invitee_email: email, invited_by: captainEmail || "captain",
+      inviter_user_id: captain.id,
       status: "pending",
       token: crypto.randomBytes(24).toString("hex"),
     }))
@@ -121,7 +122,7 @@ exports.handler = async (event) => {
       })
     )
 
-    return json(200, { ok: true, team, invites_count: invites.length })
+    return json(200, { ok: true, team_id: team.id, invites_count: invites.length })
   } catch (e) {
     return json(500, { error: e.message || "Server error" })
   }
