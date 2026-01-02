@@ -155,4 +155,57 @@ exports.handler = async (event) => {
     }
 
     // 4) If roster row didn't exist (edge case), insert team_members row
-    // (This keeps the system resilient even if you
+    // (This keeps the system resilient even if you ever change registration behavior.)
+    if (!claimedMemberId) {
+      const { data: inserted, error: insertErr } = await supabaseAdmin
+        .from("team_members")
+        .insert({
+          team_id: inv.team_id,
+          user_id: user.id,
+          role: "member",
+          member_email: inviteEmail || myEmail || null,
+          full_name: null,       // unknown here; user can update later
+          date_of_birth: null,   // NOT collected here per your policy
+        })
+        .select("id")
+        .single()
+
+      if (insertErr) return json(400, { error: insertErr.message })
+      claimedMemberId = inserted?.id || null
+    }
+
+    // 5) Mark invite accepted
+    const { error: updErr } = await supabaseAdmin
+      .from("team_invitations")
+      .update({
+        status: "accepted",
+        invitee_user_id: user.id,
+        accepted_at: new Date().toISOString(), // only if column exists; harmless if not? (it will error)
+      })
+      .eq("id", inv.id)
+
+    // If accepted_at column doesn't exist, retry without it
+    if (updErr && String(updErr.message || "").toLowerCase().includes("accepted_at")) {
+      const { error: updErr2 } = await supabaseAdmin
+        .from("team_invitations")
+        .update({
+          status: "accepted",
+          invitee_user_id: user.id,
+        })
+        .eq("id", inv.id)
+
+      if (updErr2) return json(400, { error: updErr2.message })
+    } else if (updErr) {
+      return json(400, { error: updErr.message })
+    }
+
+    return json(200, {
+      ok: true,
+      team_id: inv.team_id,
+      competition_id: inv.competition_id,
+      team_member_id: claimedMemberId,
+    })
+  } catch (e) {
+    return json(500, { error: e.message || "Server error" })
+  }
+}
