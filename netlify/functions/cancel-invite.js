@@ -31,7 +31,7 @@ exports.handler = async (event) => {
 
   const { data: inv, error: invErr } = await supabaseAdmin
     .from("team_invitations")
-    .select("id, status, team_id, teams:team_id ( id, captain_user_id )")
+    .select("id, status, team_id, team_member_id, invitee_email, teams:team_id ( id, captain_user_id )")
     .eq("id", invitation_id)
     .single()
 
@@ -42,6 +42,7 @@ exports.handler = async (event) => {
   if (!team) return json(400, { error: "Team not found for invite" })
   if (team.captain_user_id !== user.id) return json(403, { error: "Only the captain can cancel invites" })
 
+  // 1) revoke invite
   const { error: updErr } = await supabaseAdmin
     .from("team_invitations")
     .update({ status: "revoked" })
@@ -49,5 +50,25 @@ exports.handler = async (event) => {
 
   if (updErr) return json(400, { error: updErr.message })
 
-  return json(200, { ok: true })
+  // 2) detach roster slot if it exists AND is still unclaimed
+  // (this prevents "revoked but still looks invite-pending" on roster)
+  let detached = false
+  if (inv.team_member_id) {
+    const { data: tm, error: tmErr } = await supabaseAdmin
+      .from("team_members")
+      .select("id, user_id, member_email")
+      .eq("id", inv.team_member_id)
+      .maybeSingle()
+
+    if (!tmErr && tm?.id && !tm.user_id) {
+      const { error: clearErr } = await supabaseAdmin
+        .from("team_members")
+        .update({ member_email: null })
+        .eq("id", tm.id)
+
+      if (!clearErr) detached = true
+    }
+  }
+
+  return json(200, { ok: true, detached })
 }
