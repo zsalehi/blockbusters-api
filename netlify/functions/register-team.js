@@ -30,6 +30,7 @@ function isValidDOB(dob) {
   if (!dob) return false
   const dt = new Date(dob)
   if (Number.isNaN(dt.getTime())) return false
+  // must be in the past
   return dt < new Date()
 }
 
@@ -39,17 +40,17 @@ exports.handler = async (event) => {
 
   try {
     const authHeader = event.headers.authorization || event.headers.Authorization
-    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null
-    if (!token) return json(401, { error: "Missing bearer token" })
+    const bearer = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null
+    if (!bearer) return json(401, { error: "Missing bearer token" })
 
-    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token)
+    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(bearer)
     if (userErr || !userData?.user) return json(401, { error: "Invalid session" })
 
     const captainUser = userData.user
     const captainEmail = normalizeEmail(captainUser.email)
 
     const body = JSON.parse(event.body || "{}")
-    const competition_id = body.competition_id
+    const competition_id = String(body.competition_id || "").trim()
     const team_name = String(body.team_name || "").trim()
     const members = Array.isArray(body.members) ? body.members : []
 
@@ -60,6 +61,15 @@ exports.handler = async (event) => {
 
     const captainPayload = members.find((m) => m.role === "captain")
     if (!captainPayload) return json(400, { error: "Missing captain in members[] payload." })
+
+    // Validate competition exists (optional but safer)
+    const { data: comp, error: compErr } = await supabaseAdmin
+      .from("competitions")
+      .select("id")
+      .eq("id", competition_id)
+      .single()
+
+    if (compErr || !comp) return json(404, { error: "Competition not found." })
 
     // Strict: captain cannot already be on a team in this competition
     const { data: existingMemberRows, error: exErr } = await supabaseAdmin
@@ -76,7 +86,7 @@ exports.handler = async (event) => {
       })
     }
 
-    // Validate roster (full_name + dob required for ALL members per your policy)
+    // Clean + validate roster (full_name + dob required for ALL members)
     const cleanedMembers = members.map((m) => ({
       role: m.role === "captain" ? "captain" : "member",
       full_name: String(m.full_name || "").trim(),
@@ -101,12 +111,14 @@ exports.handler = async (event) => {
         captain_user_id: captainUser.id,
         created_by: captainUser.id,
       })
-      .select("id, name")
+      .select("id, name, competition_id")
       .single()
 
     if (teamErr) return json(400, { error: teamErr.message })
 
     // Insert team_members roster rows
+    const nowIso = new Date().toISOString()
+
     const rosterRows = cleanedMembers.map((m) => ({
       team_id: team.id,
       user_id: m.role === "captain" ? captainUser.id : null,
@@ -116,7 +128,7 @@ exports.handler = async (event) => {
       handle: m.handle || null,
       phone: m.phone || null,
       member_email: m.email || null, // optional; used for invites if present
-      created_at: new Date().toISOString(),
+      created_at: nowIso,
     }))
 
     const { data: insertedMembers, error: memberErr } = await supabaseAdmin
@@ -127,29 +139,28 @@ exports.handler = async (event) => {
     if (memberErr) return json(400, { error: memberErr.message })
 
     // Create invitations for non-user members that have an email
-    const inviteTargets = insertedMembers.filter((m) => !m.user_id && m.member_email)
+    const inviteTargets = (insertedMembers || []).filter((m) => !m.user_id && m.member_email)
 
     let invites = []
     if (inviteTargets.length) {
       const inviteRows = inviteTargets.map((m) => ({
         team_id: team.id,
-        competition_id,
+        competition_id: team.competition_id, // source of truth = team
         inviter_user_id: captainUser.id,
-        invitee_email: m.member_email,
+        invitee_email: normalizeEmail(m.member_email),
         invitee_user_id: null,
         role: "member",
         status: "pending",
         token: crypto.randomBytes(24).toString("hex"),
         expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
-        created_at: new Date().toISOString(),
-        // If you added this column:
-        // team_member_id: m.id,
+        created_at: nowIso,
+        team_member_id: m.id, // ✅ deterministic linking later
       }))
 
       const { data: invData, error: invErr } = await supabaseAdmin
         .from("team_invitations")
         .insert(inviteRows)
-        .select()
+        .select("invitee_email, token")
 
       if (invErr) return json(400, { error: invErr.message })
       invites = invData || []

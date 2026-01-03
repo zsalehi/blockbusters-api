@@ -39,10 +39,10 @@ exports.handler = async (event) => {
 
   try {
     const authHeader = event.headers.authorization || event.headers.Authorization
-    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null
-    if (!token) return json(401, { error: "Missing bearer token" })
+    const bearer = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null
+    if (!bearer) return json(401, { error: "Missing bearer token" })
 
-    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token)
+    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(bearer)
     if (userErr || !userData?.user) return json(401, { error: "Invalid session" })
 
     const user = userData.user
@@ -91,7 +91,7 @@ exports.handler = async (event) => {
       if (!isValidDOB(r.date_of_birth)) return json(400, { error: `Member ${i + 1}: valid date_of_birth is required.` })
     }
 
-    // Prevent duplicates by email already on roster
+    // Prevent duplicates by email already on roster (for provided emails)
     const emails = cleaned.map((r) => r.email).filter(Boolean)
     if (emails.length) {
       const { data: existingEmails, error: exErr } = await supabaseAdmin
@@ -106,6 +106,8 @@ exports.handler = async (event) => {
       }
     }
 
+    const nowIso = new Date().toISOString()
+
     // Insert roster rows
     const rosterRows = cleaned.map((m) => ({
       team_id,
@@ -116,7 +118,7 @@ exports.handler = async (event) => {
       handle: m.handle || null,
       phone: m.phone || null,
       member_email: m.email || null,
-      created_at: new Date().toISOString(),
+      created_at: nowIso,
     }))
 
     const { data: inserted, error: insErr } = await supabaseAdmin
@@ -126,7 +128,7 @@ exports.handler = async (event) => {
 
     if (insErr) return json(400, { error: insErr.message })
 
-    // Avoid duplicate pending invites
+    // Load existing invites (avoid duplicate pending invites)
     const { data: existingInvites, error: invErr } = await supabaseAdmin
       .from("team_invitations")
       .select("invitee_email, status")
@@ -137,26 +139,31 @@ exports.handler = async (event) => {
     const pendingSet = new Set(
       (existingInvites || [])
         .filter((i) => i.status === "pending")
-        .map((i) => (i.invitee_email || "").toLowerCase())
+        .map((i) => normalizeEmail(i.invitee_email))
+        .filter(Boolean)
     )
 
+    // Build invite targets with deterministic team_member_id linkage
     const inviteTargets = (inserted || [])
-      .map((r) => normalizeEmail(r.member_email))
-      .filter(Boolean)
-      .filter((em) => !pendingSet.has(em))
+      .map((r) => ({
+        team_member_id: r.id,
+        email: normalizeEmail(r.member_email),
+      }))
+      .filter((x) => !!x.email)
+      .filter((x) => !pendingSet.has(x.email))
 
     let invites = []
     if (inviteTargets.length) {
-      const inviteRows = inviteTargets.map((email) => ({
+      const inviteRows = inviteTargets.map((t) => ({
         team_id,
-        competition_id: team.competition_id,
-        invitee_email: email,
+        competition_id: team.competition_id, // source of truth = team
+        invitee_email: t.email,
         status: "pending",
         token: crypto.randomBytes(24).toString("hex"),
-        invited_by: captainEmail || "captain",
         inviter_user_id: user.id,
+        team_member_id: t.team_member_id, // ✅ deterministic linking later
         expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
-        created_at: new Date().toISOString(),
+        created_at: nowIso,
       }))
 
       const { data: invInserted, error: invInsErr } = await supabaseAdmin
@@ -189,7 +196,11 @@ exports.handler = async (event) => {
       }
     }
 
-    return json(200, { ok: true, inserted_count: (inserted || []).length, invites_count: invites.length })
+    return json(200, {
+      ok: true,
+      inserted_count: (inserted || []).length,
+      invites_count: invites.length,
+    })
   } catch (e) {
     return json(500, { error: e.message || "Server error" })
   }

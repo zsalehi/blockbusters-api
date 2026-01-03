@@ -28,10 +28,10 @@ exports.handler = async (event) => {
 
   try {
     const authHeader = event.headers.authorization || event.headers.Authorization
-    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null
-    if (!token) return json(401, { error: "Missing bearer token" })
+    const bearer = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null
+    if (!bearer) return json(401, { error: "Missing bearer token" })
 
-    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(token)
+    const { data: userData, error: userErr } = await supabaseAdmin.auth.getUser(bearer)
     if (userErr || !userData?.user) return json(401, { error: "Invalid session" })
 
     const user = userData.user
@@ -41,20 +41,19 @@ exports.handler = async (event) => {
     const inviteToken = String(body.token || "").trim()
     if (!inviteToken) return json(400, { error: "Missing invite token" })
 
-    // 1) Fetch invitation
+    // 1) Fetch invitation (select only what we need + team_member_id)
     const { data: inv, error: invErr } = await supabaseAdmin
       .from("team_invitations")
-      .select("*")
+      .select("id, team_id, token, status, expires_at, invitee_email, invitee_user_id, role, team_member_id")
       .eq("token", inviteToken)
       .single()
 
     if (invErr || !inv) return json(404, { error: "Invite not found" })
-
     if (inv.status !== "pending") {
       return json(400, { error: `Invite is not pending (status: ${inv.status}).` })
     }
 
-    // Optional expiry support
+    // Optional expiry
     if (inv.expires_at) {
       const exp = new Date(inv.expires_at).getTime()
       if (!Number.isNaN(exp) && Date.now() > exp) {
@@ -69,14 +68,14 @@ exports.handler = async (event) => {
 
     const inviteEmail = normalizeEmail(inv.invitee_email)
 
-    // Security/UX: user must be logged into the same email the invite was sent to
+    // Security/UX: must match invited email
     if (inviteEmail && myEmail && inviteEmail !== myEmail) {
       return json(403, {
         error: `This invite was sent to ${inviteEmail}. You are signed in as ${myEmail}. Please sign in with the invited email.`,
       })
     }
 
-    // ✅ FIX: derive competition_id from TEAM (do NOT trust inv.competition_id)
+    // ✅ Source of truth for competition_id is TEAMS (not team_invitations)
     const { data: teamRow, error: teamErr } = await supabaseAdmin
       .from("teams")
       .select("id, competition_id")
@@ -89,7 +88,7 @@ exports.handler = async (event) => {
 
     const effectiveCompetitionId = teamRow.competition_id
 
-    // 2) Strict rule: invitee can only be on one team per competition
+    // 2) One-team-per-competition enforcement
     const { data: existing, error: existingErr } = await supabaseAdmin
       .from("team_members")
       .select("team_id, teams!inner(competition_id)")
@@ -105,15 +104,15 @@ exports.handler = async (event) => {
       })
     }
 
-    // 3) Claim roster row in team_members if it exists (team_id + member_email)
+    // 3) Claim roster row deterministically via team_member_id if present
     let claimedMemberId = null
 
-    if (inviteEmail) {
+    if (inv.team_member_id) {
       const { data: rosterRow, error: rosterErr } = await supabaseAdmin
         .from("team_members")
         .select("id, user_id, full_name, handle, phone")
+        .eq("id", inv.team_member_id)
         .eq("team_id", inv.team_id)
-        .ilike("member_email", inviteEmail)
         .maybeSingle()
 
       if (rosterErr) return json(400, { error: rosterErr.message })
@@ -129,6 +128,7 @@ exports.handler = async (event) => {
           .eq("id", rosterRow.id)
 
         if (claimErr) return json(400, { error: claimErr.message })
+
         claimedMemberId = rosterRow.id
 
         // Optional: bootstrap profiles from roster (NO DOB)
@@ -158,57 +158,25 @@ exports.handler = async (event) => {
       }
     }
 
-    // 4) If roster row didn't exist, insert team_members row
-    if (!claimedMemberId) {
-      const { data: inserted, error: insertErr } = await supabaseAdmin
+    // Fallback: claim by email if team_member_id missing (older invites)
+    if (!claimedMemberId && inviteEmail) {
+      const { data: rosterRow, error: rosterErr } = await supabaseAdmin
         .from("team_members")
-        .insert({
-          team_id: inv.team_id,
-          user_id: user.id,
-          role: "member",
-          member_email: inviteEmail || myEmail || null,
-          full_name: null,
-          date_of_birth: null,
-        })
-        .select("id")
-        .single()
+        .select("id, user_id, full_name, handle, phone")
+        .eq("team_id", inv.team_id)
+        .ilike("member_email", inviteEmail)
+        .maybeSingle()
 
-      if (insertErr) return json(400, { error: insertErr.message })
-      claimedMemberId = inserted?.id || null
-    }
+      if (rosterErr) return json(400, { error: rosterErr.message })
 
-    // 5) Mark invite accepted
-    const { error: updErr } = await supabaseAdmin
-      .from("team_invitations")
-      .update({
-        status: "accepted",
-        invitee_user_id: user.id,
-        accepted_at: new Date().toISOString(), // will error if column doesn't exist
-      })
-      .eq("id", inv.id)
+      if (rosterRow?.id) {
+        if (rosterRow.user_id && rosterRow.user_id !== user.id) {
+          return json(409, { error: "That roster spot has already been claimed by another account." })
+        }
 
-    // If accepted_at column doesn't exist, retry without it
-    if (updErr && String(updErr.message || "").toLowerCase().includes("accepted_at")) {
-      const { error: updErr2 } = await supabaseAdmin
-        .from("team_invitations")
-        .update({
-          status: "accepted",
-          invitee_user_id: user.id,
-        })
-        .eq("id", inv.id)
+        const { error: claimErr } = await supabaseAdmin
+          .from("team_members")
+          .update({ user_id: user.id })
+          .eq("id", rosterRow.id)
 
-      if (updErr2) return json(400, { error: updErr2.message })
-    } else if (updErr) {
-      return json(400, { error: updErr.message })
-    }
-
-    return json(200, {
-      ok: true,
-      team_id: inv.team_id,
-      competition_id: effectiveCompetitionId,
-      team_member_id: claimedMemberId,
-    })
-  } catch (e) {
-    return json(500, { error: e.message || "Server error" })
-  }
-}
+        if (claimErr) return json(400, { error: claimErr.m
