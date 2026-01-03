@@ -89,9 +89,9 @@ exports.handler = async (event) => {
     invitee_email: email,
     status: "pending",
     token: crypto.randomBytes(24).toString("hex"),
-    invited_by: user.email,       // NOT NULL
-    inviter_user_id: user.id,     // NOT NULL
-  }))
+    inviter_user_id: user.id,
+ }))
+
 
   // Filter out emails already invited pending
   const pendingSet = new Set(
