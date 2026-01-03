@@ -58,7 +58,6 @@ exports.handler = async (event) => {
     if (inv.expires_at) {
       const exp = new Date(inv.expires_at).getTime()
       if (!Number.isNaN(exp) && Date.now() > exp) {
-        // Mark expired (best effort)
         await supabaseAdmin
           .from("team_invitations")
           .update({ status: "expired" })
@@ -77,24 +76,36 @@ exports.handler = async (event) => {
       })
     }
 
+    // ✅ FIX: derive competition_id from TEAM (do NOT trust inv.competition_id)
+    const { data: teamRow, error: teamErr } = await supabaseAdmin
+      .from("teams")
+      .select("id, competition_id")
+      .eq("id", inv.team_id)
+      .single()
+
+    if (teamErr || !teamRow) {
+      return json(404, { error: "Team not found for this invite." })
+    }
+
+    const effectiveCompetitionId = teamRow.competition_id
+
     // 2) Strict rule: invitee can only be on one team per competition
-    // (same rule you enforced for captains)
     const { data: existing, error: existingErr } = await supabaseAdmin
       .from("team_members")
       .select("team_id, teams!inner(competition_id)")
       .eq("user_id", user.id)
-      .eq("teams.competition_id", inv.competition_id)
+      .eq("teams.competition_id", effectiveCompetitionId)
 
     if (existingErr) return json(400, { error: existingErr.message })
     if (existing && existing.length > 0) {
       return json(409, {
         error: "You’re already registered on a team for this competition.",
         team_id: existing[0].team_id,
+        competition_id: effectiveCompetitionId,
       })
     }
 
     // 3) Claim roster row in team_members if it exists (team_id + member_email)
-    // Your new register-team inserts a roster row with member_email for invited members.
     let claimedMemberId = null
 
     if (inviteEmail) {
@@ -108,24 +119,19 @@ exports.handler = async (event) => {
       if (rosterErr) return json(400, { error: rosterErr.message })
 
       if (rosterRow?.id) {
-        // If already claimed, prevent weirdness
         if (rosterRow.user_id && rosterRow.user_id !== user.id) {
           return json(409, { error: "That roster spot has already been claimed by another account." })
         }
 
         const { error: claimErr } = await supabaseAdmin
           .from("team_members")
-          .update({
-            user_id: user.id,
-            // keep role as member; do not overwrite full_name/dob unless you want to
-          })
+          .update({ user_id: user.id })
           .eq("id", rosterRow.id)
 
         if (claimErr) return json(400, { error: claimErr.message })
         claimedMemberId = rosterRow.id
 
         // Optional: bootstrap profiles from roster (NO DOB)
-        // Only fill if missing.
         const { data: prof } = await supabaseAdmin
           .from("profiles")
           .select("full_name, handle, phone")
@@ -138,13 +144,11 @@ exports.handler = async (event) => {
           if (!prof.handle && rosterRow.handle) patch.handle = rosterRow.handle
           if (!prof.phone && rosterRow.phone) patch.phone = rosterRow.phone
         } else {
-          // profile missing: create minimal
           patch.full_name = rosterRow.full_name || null
           patch.handle = rosterRow.handle || null
           patch.phone = rosterRow.phone || null
         }
 
-        // only write if we have something to write
         if (Object.keys(patch).length > 0) {
           await supabaseAdmin.from("profiles").upsert(
             { id: user.id, ...patch },
@@ -154,8 +158,7 @@ exports.handler = async (event) => {
       }
     }
 
-    // 4) If roster row didn't exist (edge case), insert team_members row
-    // (This keeps the system resilient even if you ever change registration behavior.)
+    // 4) If roster row didn't exist, insert team_members row
     if (!claimedMemberId) {
       const { data: inserted, error: insertErr } = await supabaseAdmin
         .from("team_members")
@@ -164,8 +167,8 @@ exports.handler = async (event) => {
           user_id: user.id,
           role: "member",
           member_email: inviteEmail || myEmail || null,
-          full_name: null,       // unknown here; user can update later
-          date_of_birth: null,   // NOT collected here per your policy
+          full_name: null,
+          date_of_birth: null,
         })
         .select("id")
         .single()
@@ -180,7 +183,7 @@ exports.handler = async (event) => {
       .update({
         status: "accepted",
         invitee_user_id: user.id,
-        accepted_at: new Date().toISOString(), // only if column exists; harmless if not? (it will error)
+        accepted_at: new Date().toISOString(), // will error if column doesn't exist
       })
       .eq("id", inv.id)
 
@@ -202,7 +205,7 @@ exports.handler = async (event) => {
     return json(200, {
       ok: true,
       team_id: inv.team_id,
-      competition_id: inv.competition_id,
+      competition_id: effectiveCompetitionId,
       team_member_id: claimedMemberId,
     })
   } catch (e) {
