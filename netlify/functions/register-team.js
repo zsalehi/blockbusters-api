@@ -34,6 +34,129 @@ function isValidDOB(dob) {
   return dt < new Date()
 }
 
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;")
+}
+
+function calcAge(dob) {
+  if (!dob) return ""
+  const d = new Date(dob)
+  if (Number.isNaN(d.getTime())) return ""
+  const now = new Date()
+  let age = now.getFullYear() - d.getFullYear()
+  const m = now.getMonth() - d.getMonth()
+  if (m < 0 || (m === 0 && now.getDate() < d.getDate())) age--
+  return age >= 0 ? String(age) : ""
+}
+
+function fmtDate(d) {
+  if (!d) return ""
+  const dt = new Date(d)
+  if (Number.isNaN(dt.getTime())) return ""
+  return dt.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
+}
+
+async function sendAdminRegistrationEmail({
+  team,
+  captainEmail,
+  cleanedMembers,
+  competition,
+}) {
+  const toRaw = process.env.REGISTRATION_NOTIFY_TO || "info@blockbusterstrivia.com"
+  const to = toRaw
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+
+  const from =
+    process.env.RESEND_FROM || "BlockBusters Trivia <noreply@blockbusterstrivia.com>"
+  const siteUrl = process.env.SITE_URL || "https://blockbusterstrivia.com"
+  const teamLink = `${siteUrl}/team?id=${encodeURIComponent(team.id)}`
+
+  // captain = from cleaned roster (role=captain), fallback to auth email
+  const cap = cleanedMembers.find((m) => m.role === "captain") || null
+  const capName = cap?.full_name || "Captain"
+  const capEmail = captainEmail || cap?.email || ""
+
+  const rosterRowsHtml = cleanedMembers
+    .map((m) => {
+      const handle = String(m.handle || "").replace(/^@/, "")
+      const email = String(m.email || "")
+      const phone = String(m.phone || "")
+      const age = calcAge(m.date_of_birth)
+
+      return `
+        <tr>
+          <td style="padding:8px;border-top:1px solid #eee;"><b>${escapeHtml(m.role)}</b></td>
+          <td style="padding:8px;border-top:1px solid #eee;">${escapeHtml(m.full_name)}</td>
+          <td style="padding:8px;border-top:1px solid #eee;">${handle ? "@" + escapeHtml(handle) : ""}</td>
+          <td style="padding:8px;border-top:1px solid #eee;">${escapeHtml(email)}</td>
+          <td style="padding:8px;border-top:1px solid #eee;">${escapeHtml(phone)}</td>
+          <td style="padding:8px;border-top:1px solid #eee;">${escapeHtml(age)}</td>
+        </tr>
+      `
+    })
+    .join("")
+
+  const compTitle = competition?.title || team.competition_id
+  const compStart = fmtDate(competition?.start_at)
+  const compEnd = fmtDate(competition?.end_at)
+
+  const subject = `New team registration: ${team.name} (${compTitle})`
+
+  const html = `
+    <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto; line-height:1.45;">
+      <h2 style="margin:0 0 6px;">New Team Registration ✅</h2>
+      <div style="color:#555;margin-bottom:14px;">
+        A team has registered for a competition.
+      </div>
+
+      <div style="padding:12px;border:1px solid #eee;border-radius:10px;margin-bottom:14px;">
+        <div><b>Competition:</b> ${escapeHtml(compTitle)} ${compStart ? `(${escapeHtml(compStart)}${compEnd ? " – " + escapeHtml(compEnd) : ""})` : ""}</div>
+        <div><b>Team:</b> ${escapeHtml(team.name)} <span style="color:#777;">(ID: ${escapeHtml(team.id)})</span></div>
+        <div><b>Captain:</b> ${escapeHtml(capName)} ${capEmail ? `&lt;${escapeHtml(capEmail)}&gt;` : ""}</div>
+
+        <div style="margin-top:10px;">
+          <a href="${teamLink}" style="display:inline-block;padding:10px 14px;border-radius:8px;background:#111;color:#fff;text-decoration:none;">
+            Open Team Manage
+          </a>
+          <div style="font-size:12px;color:#777;margin-top:8px;">
+            If the button doesn’t work, copy/paste: ${escapeHtml(teamLink)}
+          </div>
+        </div>
+      </div>
+
+      <h3 style="margin:0 0 8px;">Roster</h3>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #eee;border-radius:10px;overflow:hidden;">
+        <thead>
+          <tr style="background:#fafafa;">
+            <th align="left" style="padding:10px;">Role</th>
+            <th align="left" style="padding:10px;">Name</th>
+            <th align="left" style="padding:10px;">Handle</th>
+            <th align="left" style="padding:10px;">Email</th>
+            <th align="left" style="padding:10px;">Phone</th>
+            <th align="left" style="padding:10px;">Age</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rosterRowsHtml || `<tr><td style="padding:10px;">No members</td></tr>`}
+        </tbody>
+      </table>
+
+      <div style="margin-top:14px;color:#777;font-size:12px;">
+        Sent automatically by BlockBusters Trivia registration flow.
+      </div>
+    </div>
+  `
+
+  await resend.emails.send({ from, to, subject, html })
+}
+
 exports.handler = async (event) => {
   if (event.httpMethod === "OPTIONS") return json(200, { ok: true })
   if (event.httpMethod !== "POST") return json(405, { error: "Method not allowed" })
@@ -62,10 +185,10 @@ exports.handler = async (event) => {
     const captainPayload = members.find((m) => m.role === "captain")
     if (!captainPayload) return json(400, { error: "Missing captain in members[] payload." })
 
-    // Validate competition exists (optional but safer)
+    // Validate competition exists (+ get useful fields for admin email)
     const { data: comp, error: compErr } = await supabaseAdmin
       .from("competitions")
-      .select("id")
+      .select("id, title, start_at, end_at")
       .eq("id", competition_id)
       .single()
 
@@ -166,7 +289,7 @@ exports.handler = async (event) => {
       invites = invData || []
     }
 
-    // Send emails via Resend (best-effort)
+    // Send teammate invite emails (best-effort)
     const siteUrl = process.env.SITE_URL || "https://blockbusterstrivia.com"
     const from = process.env.RESEND_FROM || "BlockBusters Trivia <noreply@blockbusterstrivia.com>"
 
@@ -188,6 +311,18 @@ exports.handler = async (event) => {
         })
       })
     )
+
+    // ✅ Send admin notification email (best-effort; do NOT fail registration if it errors)
+    try {
+      await sendAdminRegistrationEmail({
+        team,
+        captainEmail,
+        cleanedMembers,
+        competition: comp,
+      })
+    } catch (e) {
+      console.error("Admin registration email failed:", e?.message || e)
+    }
 
     return json(200, {
       ok: true,
