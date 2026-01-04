@@ -1,3 +1,4 @@
+// invite-team-members.js
 const { createClient } = require("@supabase/supabase-js")
 const { Resend } = require("resend")
 const crypto = require("crypto")
@@ -31,6 +32,47 @@ function isValidDOB(dob) {
   const dt = new Date(dob)
   if (Number.isNaN(dt.getTime())) return false
   return dt < new Date()
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+// Resend: 2 req/sec limit. We pace and retry on 429.
+async function sendResendWithRetry(payload, opts = {}) {
+  const {
+    maxAttempts = 5,
+    baseDelayMs = 650, // ~1.5 req/sec pacing (safe under 2/sec)
+    jitterMs = 150,
+  } = opts
+
+  let attempt = 0
+  while (attempt < maxAttempts) {
+    attempt++
+    try {
+      // Gentle pacing BEFORE every attempt to avoid bursts
+      await sleep(baseDelayMs + Math.floor(Math.random() * jitterMs))
+
+      const res = await resend.emails.send(payload)
+      return { ok: true, res }
+    } catch (err) {
+      const status = err?.statusCode || err?.status || null
+      const name = err?.name || ""
+      const msg = String(err?.message || "")
+
+      // Retry on Resend rate limits (429)
+      if (status === 429 || name === "rate_limit_exceeded" || msg.toLowerCase().includes("too many requests")) {
+        const backoff = Math.min(4000, baseDelayMs * Math.pow(2, attempt - 1))
+        await sleep(backoff + Math.floor(Math.random() * jitterMs))
+        continue
+      }
+
+      // Non-retryable error
+      return { ok: false, error: err }
+    }
+  }
+
+  return { ok: false, error: new Error("Resend rate limit: max retries exceeded") }
 }
 
 exports.handler = async (event) => {
@@ -71,6 +113,7 @@ exports.handler = async (event) => {
       .eq("team_id", team_id)
 
     if (countErr) return json(400, { error: countErr.message })
+
     const currentSize = count || 0
     const remainingSlots = Math.max(0, 4 - currentSize)
     if (remainingSlots <= 0) return json(400, { error: "Team is already full (max 4)." })
@@ -173,25 +216,43 @@ exports.handler = async (event) => {
 
       if (invInsErr) return json(400, { error: invInsErr.message })
       invites = invInserted || []
+    }
 
-      // Send emails
-      const siteUrl = process.env.SITE_URL || "https://blockbusterstrivia.com"
-      const from = process.env.RESEND_FROM || "BlockBusters Trivia <noreply@blockbusterstrivia.com>"
+    // Send emails (best-effort, rate-limited)
+    const siteUrl = process.env.SITE_URL || "https://blockbusterstrivia.com"
+    const from = process.env.RESEND_FROM || "BlockBusters Trivia <noreply@blockbusterstrivia.com>"
 
-      for (const row of invites) {
-        const link = `${siteUrl}/invite?token=${row.token}`
-        await resend.emails.send({
-          from,
+    let email_attempted = 0
+    let email_sent = 0
+    let email_failed = 0
+
+    for (const row of invites) {
+      email_attempted++
+      const link = `${siteUrl}/invite?token=${row.token}`
+
+      const payload = {
+        from,
+        to: row.invitee_email,
+        subject: `You’re invited to join ${team.name}`,
+        html: `
+          <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto">
+            <h2>You’re invited</h2>
+            <p><b>${captainEmail || "A team captain"}</b> invited you to join <b>${team.name}</b>.</p>
+            <p><a href="${link}">Accept Invite</a></p>
+            <p style="color:#666">If the button doesn’t work, copy/paste this link:<br/>${link}</p>
+          </div>
+        `,
+      }
+
+      const r = await sendResendWithRetry(payload)
+      if (r.ok) email_sent++
+      else {
+        email_failed++
+        console.error("Invite email failed:", {
           to: row.invitee_email,
-          subject: `You’re invited to join ${team.name}`,
-          html: `
-            <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto">
-              <h2>You’re invited</h2>
-              <p><b>${captainEmail || "A team captain"}</b> invited you to join <b>${team.name}</b>.</p>
-              <p><a href="${link}">Accept Invite</a></p>
-              <p style="color:#666">If the button doesn’t work, copy/paste this link:<br/>${link}</p>
-            </div>
-          `,
+          message: r.error?.message || r.error,
+          statusCode: r.error?.statusCode || r.error?.status,
+          name: r.error?.name,
         })
       }
     }
@@ -200,6 +261,9 @@ exports.handler = async (event) => {
       ok: true,
       inserted_count: (inserted || []).length,
       invites_count: invites.length,
+      email_attempted,
+      email_sent,
+      email_failed,
     })
   } catch (e) {
     return json(500, { error: e.message || "Server error" })
