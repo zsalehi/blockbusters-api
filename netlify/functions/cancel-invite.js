@@ -51,7 +51,6 @@ exports.handler = async (event) => {
   if (updErr) return json(400, { error: updErr.message })
 
   // 2) detach roster slot if it exists AND is still unclaimed
-  // (this prevents "revoked but still looks invite-pending" on roster)
   let detached = false
   if (inv.team_member_id) {
     const { data: tm, error: tmErr } = await supabaseAdmin
@@ -61,10 +60,12 @@ exports.handler = async (event) => {
       .maybeSingle()
 
     if (!tmErr && tm?.id && !tm.user_id) {
+      // Only clear if still unclaimed (extra safety)
       const { error: clearErr } = await supabaseAdmin
         .from("team_members")
         .update({ member_email: null })
         .eq("id", tm.id)
+        .is("user_id", null)
 
       if (!clearErr) detached = true
     }

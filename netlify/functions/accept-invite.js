@@ -75,100 +75,147 @@ exports.handler = async (event) => {
       })
     }
 
-    // 3) Claim the roster row that matches this invite (BEST: team_member_id)
+    // 3) Claim the roster row that matches this invite
     let claimedMemberId = null
 
-    if (inv.team_member_id) {
+    // Helper: attempt to claim a roster row atomically-ish
+    async function claimRosterRowById(teamMemberId) {
+      // Read the row first (for profile bootstrap + validation)
       const { data: rosterRow, error: rosterErr } = await supabaseAdmin
         .from("team_members")
         .select("id, user_id, full_name, handle, phone")
-        .eq("id", inv.team_member_id)
+        .eq("id", teamMemberId)
         .eq("team_id", inv.team_id)
         .maybeSingle()
 
-      if (rosterErr) return json(event, 400, { error: rosterErr.message })
-      if (!rosterRow) return json(event, 400, { error: "Roster row not found for this invite." })
+      if (rosterErr) return { ok: false, error: rosterErr, rosterRow: null }
+      if (!rosterRow) return { ok: false, error: null, rosterRow: null } // not found
 
       if (rosterRow.user_id && rosterRow.user_id !== user.id) {
-        return json(event, 409, { error: "That roster spot has already been claimed by another account." })
+        return { ok: false, error: { message: "That roster spot has already been claimed by another account." }, rosterRow }
       }
 
+      // If already claimed by me, treat as success
+      if (rosterRow.user_id === user.id) {
+        return { ok: true, rosterRow }
+      }
+
+      // Conditional claim: only if still unclaimed
       const { error: claimErr } = await supabaseAdmin
         .from("team_members")
         .update({ user_id: user.id })
         .eq("id", rosterRow.id)
+        .eq("team_id", inv.team_id)
+        .is("user_id", null)
 
-      if (claimErr) return json(event, 400, { error: claimErr.message })
-      claimedMemberId = rosterRow.id
+      // If claimErr is null, it might still have affected 0 rows (Supabase doesn't always expose rowcount)
+      if (claimErr) return { ok: false, error: claimErr, rosterRow }
 
-      // Optional: bootstrap profile fields if missing
-      const { data: prof } = await supabaseAdmin
-        .from("profiles")
-        .select("full_name, handle, phone")
-        .eq("id", user.id)
+      // Re-check state
+      const { data: after, error: afterErr } = await supabaseAdmin
+        .from("team_members")
+        .select("id, user_id, full_name, handle, phone")
+        .eq("id", rosterRow.id)
         .maybeSingle()
 
-      const patch = {}
-      if (prof) {
-        if (!prof.full_name && rosterRow.full_name) patch.full_name = rosterRow.full_name
-        if (!prof.handle && rosterRow.handle) patch.handle = rosterRow.handle
-        if (!prof.phone && rosterRow.phone) patch.phone = rosterRow.phone
-      } else {
-        patch.full_name = rosterRow.full_name || null
-        patch.handle = rosterRow.handle || null
-        patch.phone = rosterRow.phone || null
+      if (afterErr) return { ok: false, error: afterErr, rosterRow }
+      if (after?.user_id && after.user_id !== user.id) {
+        return { ok: false, error: { message: "That roster spot has already been claimed by another account." }, rosterRow: after }
       }
 
-      if (Object.keys(patch).length) {
-        await supabaseAdmin.from("profiles").upsert({ id: user.id, ...patch }, { onConflict: "id" })
-      }
-    } else {
-      // Fallback: claim by email match (older invites)
-      if (inviteEmail) {
-        const { data: rosterRow, error: rosterErr } = await supabaseAdmin
-          .from("team_members")
-          .select("id, user_id")
-          .eq("team_id", inv.team_id)
-          .ilike("member_email", inviteEmail)
+      return { ok: true, rosterRow: after || rosterRow }
+    }
+
+    // A) Prefer deterministic linkage
+    let usedDeterministic = false
+    if (inv.team_member_id) {
+      const r = await claimRosterRowById(inv.team_member_id)
+      if (r.ok) {
+        usedDeterministic = true
+        claimedMemberId = r.rosterRow.id
+
+        // Optional: bootstrap profile fields if missing
+        const { data: prof } = await supabaseAdmin
+          .from("profiles")
+          .select("full_name, handle, phone")
+          .eq("id", user.id)
           .maybeSingle()
 
-        if (rosterErr) return json(event, 400, { error: rosterErr.message })
+        const patch = {}
+        if (prof) {
+          if (!prof.full_name && r.rosterRow.full_name) patch.full_name = r.rosterRow.full_name
+          if (!prof.handle && r.rosterRow.handle) patch.handle = r.rosterRow.handle
+          if (!prof.phone && r.rosterRow.phone) patch.phone = r.rosterRow.phone
+        } else {
+          patch.full_name = r.rosterRow.full_name || null
+          patch.handle = r.rosterRow.handle || null
+          patch.phone = r.rosterRow.phone || null
+        }
 
-        if (rosterRow?.id) {
-          if (rosterRow.user_id && rosterRow.user_id !== user.id) {
-            return json(event, 409, { error: "That roster spot has already been claimed by another account." })
-          }
+        if (Object.keys(patch).length) {
+          await supabaseAdmin.from("profiles").upsert({ id: user.id, ...patch }, { onConflict: "id" })
+        }
+      } else {
+        // If deterministic row missing (or detached), fall back instead of hard-failing.
+        // BUT if it's explicitly "already claimed by another account", surface that.
+        const msg = String(r.error?.message || "")
+        if (msg.toLowerCase().includes("already been claimed")) {
+          return json(event, 409, { error: msg })
+        }
+      }
+    }
 
+    // B) Fallback: claim by email match (older invites)
+    if (!claimedMemberId && inviteEmail) {
+      const { data: rosterRow, error: rosterErr } = await supabaseAdmin
+        .from("team_members")
+        .select("id, user_id")
+        .eq("team_id", inv.team_id)
+        .ilike("member_email", inviteEmail)
+        .maybeSingle()
+
+      if (rosterErr) return json(event, 400, { error: rosterErr.message })
+
+      if (rosterRow?.id) {
+        if (rosterRow.user_id && rosterRow.user_id !== user.id) {
+          return json(event, 409, { error: "That roster spot has already been claimed by another account." })
+        }
+
+        if (rosterRow.user_id === user.id) {
+          claimedMemberId = rosterRow.id
+        } else {
           const { error: claimErr } = await supabaseAdmin
             .from("team_members")
             .update({ user_id: user.id })
             .eq("id", rosterRow.id)
+            .eq("team_id", inv.team_id)
+            .is("user_id", null)
 
           if (claimErr) return json(event, 400, { error: claimErr.message })
+
           claimedMemberId = rosterRow.id
         }
       }
+    }
 
-      // If still not claimed, create a row (edge-case resilience)
-      if (!claimedMemberId) {
-        const { data: inserted, error: insertErr } = await supabaseAdmin
-          .from("team_members")
-          .insert({
-            team_id: inv.team_id,
-            user_id: user.id,
-            role: "member",
-            member_email: inviteEmail || myEmail || null,
-          })
-          .select("id")
-          .single()
+    // C) If still not claimed, create a row (edge-case resilience)
+    if (!claimedMemberId) {
+      const { data: inserted, error: insertErr } = await supabaseAdmin
+        .from("team_members")
+        .insert({
+          team_id: inv.team_id,
+          user_id: user.id,
+          role: "member",
+          member_email: inviteEmail || myEmail || null,
+        })
+        .select("id")
+        .single()
 
-        if (insertErr) return json(event, 400, { error: insertErr.message })
-        claimedMemberId = inserted?.id || null
-      }
+      if (insertErr) return json(event, 400, { error: insertErr.message })
+      claimedMemberId = inserted?.id || null
     }
 
     // 4) Mark invite accepted
-    // (Only update columns that exist. If you haven’t added accepted_at, this won’t break.)
     const patch = { status: "accepted", invitee_user_id: user.id }
     if ("accepted_at" in inv) patch.accepted_at = new Date().toISOString()
 
@@ -178,7 +225,6 @@ exports.handler = async (event) => {
       .eq("id", inv.id)
 
     if (updErr) {
-      // If accepted_at doesn’t exist, retry without it
       if (String(updErr.message || "").toLowerCase().includes("accepted_at")) {
         const { error: updErr2 } = await supabaseAdmin
           .from("team_invitations")

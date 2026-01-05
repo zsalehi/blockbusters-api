@@ -42,32 +42,35 @@ function sleep(ms) {
 async function sendResendWithRetry(payload, opts = {}) {
   const {
     maxAttempts = 5,
-    baseDelayMs = 650, // ~1.5 req/sec pacing (safe under 2/sec)
-    jitterMs = 150,
+    baseDelayMs = 750,
+    jitterMs = 200,
+    maxBackoffMs = 8000,
   } = opts
 
-  let attempt = 0
-  while (attempt < maxAttempts) {
-    attempt++
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      // Gentle pacing BEFORE every attempt to avoid bursts
       await sleep(baseDelayMs + Math.floor(Math.random() * jitterMs))
-
       const res = await resend.emails.send(payload)
       return { ok: true, res }
     } catch (err) {
       const status = err?.statusCode || err?.status || null
-      const name = err?.name || ""
-      const msg = String(err?.message || "")
+      const name = String(err?.name || "").toLowerCase()
+      const msg = String(err?.message || "").toLowerCase()
 
-      // Retry on Resend rate limits (429)
-      if (status === 429 || name === "rate_limit_exceeded" || msg.toLowerCase().includes("too many requests")) {
-        const backoff = Math.min(4000, baseDelayMs * Math.pow(2, attempt - 1))
+      const isRateLimited =
+        status === 429 ||
+        name.includes("rate_limit") ||
+        msg.includes("too many requests")
+
+      if (isRateLimited && attempt < maxAttempts) {
+        const backoff = Math.min(
+          maxBackoffMs,
+          baseDelayMs * Math.pow(2, attempt - 1)
+        )
         await sleep(backoff + Math.floor(Math.random() * jitterMs))
         continue
       }
 
-      // Non-retryable error
       return { ok: false, error: err }
     }
   }
@@ -186,7 +189,6 @@ exports.handler = async (event) => {
         .filter(Boolean)
     )
 
-    // Build invite targets with deterministic team_member_id linkage
     const inviteTargets = (inserted || [])
       .map((r) => ({
         team_member_id: r.id,
@@ -199,12 +201,12 @@ exports.handler = async (event) => {
     if (inviteTargets.length) {
       const inviteRows = inviteTargets.map((t) => ({
         team_id,
-        competition_id: team.competition_id, // source of truth = team
+        competition_id: team.competition_id,
         invitee_email: t.email,
         status: "pending",
         token: crypto.randomBytes(24).toString("hex"),
         inviter_user_id: user.id,
-        team_member_id: t.team_member_id, // ✅ deterministic linking later
+        team_member_id: t.team_member_id,
         expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
         created_at: nowIso,
       }))

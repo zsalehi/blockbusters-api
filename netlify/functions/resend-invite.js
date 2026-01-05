@@ -26,36 +26,35 @@ function sleep(ms) {
 async function sendResendWithRetry(payload, opts = {}) {
   const {
     maxAttempts = 5,
-    baseDelayMs = 650, // ~1.5 req/sec pacing (safe under 2/sec)
-    jitterMs = 150,
+    baseDelayMs = 750,
+    jitterMs = 200,
+    maxBackoffMs = 8000,
   } = opts
 
-  let attempt = 0
-  while (attempt < maxAttempts) {
-    attempt++
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      // Gentle pacing BEFORE every attempt to avoid bursts
       await sleep(baseDelayMs + Math.floor(Math.random() * jitterMs))
-
       const res = await resend.emails.send(payload)
       return { ok: true, res }
     } catch (err) {
       const status = err?.statusCode || err?.status || null
-      const name = err?.name || ""
-      const msg = String(err?.message || "")
+      const name = String(err?.name || "").toLowerCase()
+      const msg = String(err?.message || "").toLowerCase()
 
-      // Retry on Resend rate limits (429)
-      if (
+      const isRateLimited =
         status === 429 ||
-        name === "rate_limit_exceeded" ||
-        msg.toLowerCase().includes("too many requests")
-      ) {
-        const backoff = Math.min(4000, baseDelayMs * Math.pow(2, attempt - 1))
+        name.includes("rate_limit") ||
+        msg.includes("too many requests")
+
+      if (isRateLimited && attempt < maxAttempts) {
+        const backoff = Math.min(
+          maxBackoffMs,
+          baseDelayMs * Math.pow(2, attempt - 1)
+        )
         await sleep(backoff + Math.floor(Math.random() * jitterMs))
         continue
       }
 
-      // Non-retryable error
       return { ok: false, error: err }
     }
   }
@@ -80,51 +79,17 @@ exports.handler = async (event) => {
     const invitation_id = String(body.invitation_id || "").trim()
     if (!invitation_id) return json(400, { error: "invitation_id is required" })
 
-    // If you have last_sent_at, we can enforce a cooldown.
-    // If you don't, this select still works—Supabase will just ignore unknown column? (No; it will error.)
-    // So: select it optionally with a safe fallback approach: try the extended select, then fallback.
-    let inv = null
+    const { data: inv, error: invErr } = await supabaseAdmin
+      .from("team_invitations")
+      .select("id, token, status, invitee_email, team_id, team_member_id, expires_at, created_at, teams:team_id ( id, name, captain_user_id )")
+      .eq("id", invitation_id)
+      .single()
 
-    // Attempt select with last_sent_at (if column exists)
-    {
-      const { data, error } = await supabaseAdmin
-        .from("team_invitations")
-        .select(
-          "id, token, status, invitee_email, team_id, team_member_id, expires_at, created_at, last_sent_at, teams:team_id ( id, name, captain_user_id )"
-        )
-        .eq("id", invitation_id)
-        .single()
-
-      if (!error && data) inv = data
-      else {
-        // Fallback if last_sent_at doesn't exist
-        const { data: data2, error: error2 } = await supabaseAdmin
-          .from("team_invitations")
-          .select(
-            "id, token, status, invitee_email, team_id, team_member_id, expires_at, created_at, teams:team_id ( id, name, captain_user_id )"
-          )
-          .eq("id", invitation_id)
-          .single()
-
-        if (error2 || !data2) return json(404, { error: "Invite not found" })
-        inv = data2
-      }
-    }
+    if (invErr || !inv) return json(404, { error: "Invite not found" })
 
     const team = inv.teams
     if (!team) return json(400, { error: "Team not found for invite" })
     if (team.captain_user_id !== user.id) return json(403, { error: "Only the captain can resend invites" })
-
-    // Optional cooldown (default 30 seconds) if last_sent_at exists
-    const cooldownSeconds = Number(process.env.INVITE_RESEND_COOLDOWN_SECONDS || 30)
-    if (inv.last_sent_at) {
-      const last = new Date(inv.last_sent_at).getTime()
-      const now = Date.now()
-      if (!Number.isNaN(last) && now - last < cooldownSeconds * 1000) {
-        const wait = Math.ceil((cooldownSeconds * 1000 - (now - last)) / 1000)
-        return json(429, { error: `Please wait ${wait}s before resending again.` })
-      }
-    }
 
     // Allow resend for pending OR revoked.
     // If revoked, reopen it with a new token (invalidates old link).
@@ -136,34 +101,18 @@ exports.handler = async (event) => {
       tokenToSend = crypto.randomBytes(24).toString("hex")
       reopened = true
 
-      const patch = {
-        status: "pending",
-        token: tokenToSend,
-        expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
-        created_at: nowIso, // treat as re-sent "now"
-      }
-      // update last_sent_at if column exists
-      if (inv.last_sent_at !== undefined) patch.last_sent_at = nowIso
-
       const { error: reopenErr } = await supabaseAdmin
         .from("team_invitations")
-        .update(patch)
+        .update({
+          status: "pending",
+          token: tokenToSend,
+          expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+          created_at: nowIso,
+        })
         .eq("id", inv.id)
 
       if (reopenErr) return json(400, { error: reopenErr.message })
-    } else if (inv.status === "pending") {
-      // just stamp last_sent_at if available
-      if (inv.last_sent_at !== undefined) {
-        const { error: stampErr } = await supabaseAdmin
-          .from("team_invitations")
-          .update({ last_sent_at: nowIso })
-          .eq("id", inv.id)
-        if (stampErr) {
-          // not fatal
-          console.error("last_sent_at update failed:", stampErr.message)
-        }
-      }
-    } else {
+    } else if (inv.status !== "pending") {
       return json(400, { error: `Invite cannot be resent (status: ${inv.status})` })
     }
 
@@ -193,7 +142,6 @@ exports.handler = async (event) => {
         statusCode: r.error?.statusCode || r.error?.status,
         name: r.error?.name,
       })
-      // Don’t break the whole flow—tell UI it failed
       return json(502, { error: "Email send failed. Please try again in a moment." })
     }
 

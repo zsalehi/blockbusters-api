@@ -30,7 +30,6 @@ function isValidDOB(dob) {
   if (!dob) return false
   const dt = new Date(dob)
   if (Number.isNaN(dt.getTime())) return false
-  // must be in the past
   return dt < new Date()
 }
 
@@ -61,11 +60,61 @@ function fmtDate(d) {
   return dt.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
 }
 
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms))
+}
+
+/**
+ * Resend often limits to 2 req/sec.
+ * We enforce spacing AND add retry on 429.
+ */
+async function sendResendWithRetry(payload, opts = {}) {
+  const {
+    maxAttempts = 5,
+    baseDelayMs = 750, // a bit safer than 650 to reduce collisions across concurrent functions
+    jitterMs = 200,
+    maxBackoffMs = 8000,
+  } = opts
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // Gentle pacing BEFORE every attempt to avoid bursts
+      await sleep(baseDelayMs + Math.floor(Math.random() * jitterMs))
+      const res = await resend.emails.send(payload)
+      return { ok: true, res }
+    } catch (err) {
+      const status = err?.statusCode || err?.status || null
+      const name = String(err?.name || "").toLowerCase()
+      const msg = String(err?.message || "").toLowerCase()
+
+      const isRateLimited =
+        status === 429 ||
+        name.includes("rate_limit") ||
+        msg.includes("too many requests")
+
+      if (isRateLimited && attempt < maxAttempts) {
+        const backoff = Math.min(
+          maxBackoffMs,
+          baseDelayMs * Math.pow(2, attempt - 1)
+        )
+        await sleep(backoff + Math.floor(Math.random() * jitterMs))
+        continue
+      }
+
+      return { ok: false, error: err }
+    }
+  }
+
+  return { ok: false, error: new Error("Resend rate limit: max retries exceeded") }
+}
+
 async function sendAdminRegistrationEmail({
   team,
   captainEmail,
   cleanedMembers,
   competition,
+  from,
+  siteUrl,
 }) {
   const toRaw = process.env.REGISTRATION_NOTIFY_TO || "info@blockbusterstrivia.com"
   const to = toRaw
@@ -73,12 +122,8 @@ async function sendAdminRegistrationEmail({
     .map((x) => x.trim())
     .filter(Boolean)
 
-  const from =
-    process.env.RESEND_FROM || "BlockBusters Trivia <noreply@blockbusterstrivia.com>"
-  const siteUrl = process.env.SITE_URL || "https://blockbusterstrivia.com"
   const teamLink = `${siteUrl}/team?id=${encodeURIComponent(team.id)}`
 
-  // captain = from cleaned roster (role=captain), fallback to auth email
   const cap = cleanedMembers.find((m) => m.role === "captain") || null
   const capName = cap?.full_name || "Captain"
   const capEmail = captainEmail || cap?.email || ""
@@ -154,7 +199,8 @@ async function sendAdminRegistrationEmail({
     </div>
   `
 
-  await resend.emails.send({ from, to, subject, html })
+  const r = await sendResendWithRetry({ from, to, subject, html })
+  if (!r.ok) throw r.error
 }
 
 exports.handler = async (event) => {
@@ -185,7 +231,6 @@ exports.handler = async (event) => {
     const captainPayload = members.find((m) => m.role === "captain")
     if (!captainPayload) return json(400, { error: "Missing captain in members[] payload." })
 
-    // Validate competition exists (+ get useful fields for admin email)
     const { data: comp, error: compErr } = await supabaseAdmin
       .from("competitions")
       .select("id, title, start_at, end_at")
@@ -194,7 +239,6 @@ exports.handler = async (event) => {
 
     if (compErr || !comp) return json(404, { error: "Competition not found." })
 
-    // Strict: captain cannot already be on a team in this competition
     const { data: existingMemberRows, error: exErr } = await supabaseAdmin
       .from("team_members")
       .select("team_id, teams!inner(competition_id)")
@@ -209,7 +253,6 @@ exports.handler = async (event) => {
       })
     }
 
-    // Clean + validate roster (full_name + dob required for ALL members)
     const cleanedMembers = members.map((m) => ({
       role: m.role === "captain" ? "captain" : "member",
       full_name: String(m.full_name || "").trim(),
@@ -225,7 +268,6 @@ exports.handler = async (event) => {
       if (!isValidDOB(r.date_of_birth)) return json(400, { error: `Member ${i + 1}: valid date_of_birth is required.` })
     }
 
-    // Create team
     const { data: team, error: teamErr } = await supabaseAdmin
       .from("teams")
       .insert({
@@ -239,7 +281,6 @@ exports.handler = async (event) => {
 
     if (teamErr) return json(400, { error: teamErr.message })
 
-    // Insert team_members roster rows
     const nowIso = new Date().toISOString()
 
     const rosterRows = cleanedMembers.map((m) => ({
@@ -250,7 +291,7 @@ exports.handler = async (event) => {
       date_of_birth: m.date_of_birth || null,
       handle: m.handle || null,
       phone: m.phone || null,
-      member_email: m.email || null, // optional; used for invites if present
+      member_email: m.email || null,
       created_at: nowIso,
     }))
 
@@ -261,14 +302,13 @@ exports.handler = async (event) => {
 
     if (memberErr) return json(400, { error: memberErr.message })
 
-    // Create invitations for non-user members that have an email
     const inviteTargets = (insertedMembers || []).filter((m) => !m.user_id && m.member_email)
 
     let invites = []
     if (inviteTargets.length) {
       const inviteRows = inviteTargets.map((m) => ({
         team_id: team.id,
-        competition_id: team.competition_id, // source of truth = team
+        competition_id: team.competition_id,
         inviter_user_id: captainUser.id,
         invitee_email: normalizeEmail(m.member_email),
         invitee_user_id: null,
@@ -277,7 +317,7 @@ exports.handler = async (event) => {
         token: crypto.randomBytes(24).toString("hex"),
         expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
         created_at: nowIso,
-        team_member_id: m.id, // ✅ deterministic linking later
+        team_member_id: m.id,
       }))
 
       const { data: invData, error: invErr } = await supabaseAdmin
@@ -289,36 +329,41 @@ exports.handler = async (event) => {
       invites = invData || []
     }
 
-    // Send teammate invite emails (best-effort)
     const siteUrl = process.env.SITE_URL || "https://blockbusterstrivia.com"
     const from = process.env.RESEND_FROM || "BlockBusters Trivia <noreply@blockbusterstrivia.com>"
 
-    await Promise.all(
-      invites.map((inv) => {
-        const link = `${siteUrl}/invite?token=${inv.token}`
-        return resend.emails.send({
-          from,
-          to: inv.invitee_email,
-          subject: `You’ve been invited to join ${team.name}`,
-          html: `
-            <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto">
-              <h2>You’re invited to join a team</h2>
-              <p><b>${captainEmail || "A team captain"}</b> invited you to join <b>${team.name}</b>.</p>
-              <p><a href="${link}">Accept Invite</a></p>
-              <p style="color:#666">If the button doesn’t work, copy/paste this link:<br/>${link}</p>
-            </div>
-          `,
-        })
+    // Send teammate invite emails (best-effort) — throttled + retry
+    for (const inv of invites) {
+      const link = `${siteUrl}/invite?token=${inv.token}`
+      const r = await sendResendWithRetry({
+        from,
+        to: inv.invitee_email,
+        subject: `You’ve been invited to join ${team.name}`,
+        html: `
+          <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto">
+            <h2>You’re invited to join a team</h2>
+            <p><b>${captainEmail || "A team captain"}</b> invited you to join <b>${team.name}</b>.</p>
+            <p><a href="${link}">Accept Invite</a></p>
+            <p style="color:#666">If the button doesn’t work, copy/paste this link:<br/>${link}</p>
+          </div>
+        `,
       })
-    )
 
-    // ✅ Send admin notification email (best-effort; do NOT fail registration if it errors)
+      if (!r.ok) {
+        console.error("Invite email failed:", inv.invitee_email, r.error?.message || r.error)
+        // best-effort: do not fail registration
+      }
+    }
+
+    // Admin email (best-effort)
     try {
       await sendAdminRegistrationEmail({
         team,
         captainEmail,
         cleanedMembers,
         competition: comp,
+        from,
+        siteUrl,
       })
     } catch (e) {
       console.error("Admin registration email failed:", e?.message || e)
